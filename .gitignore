@@ -1,0 +1,40 @@
+# ── macOS 文件系统元数据 ──
+.DS_Store
+._*
+
+# ── 构建产物 ──
+build/
+*.o
+*.tmp
+*.kext
+*.dSYM
+*.dylib
+
+# ── 用户态二进制（./build.sh 生成）──
+nvgpud
+nvgpud.new
+smcread
+nvstat/nvstat
+
+# ── kext 构建产物（build.sh 从本机 NVRM 反汇编生成这个头）──
+kext/nvrm_bindings.h
+kext/build/
+
+# ── 历史探针二进制（nvstat/legacy 里只留源码）──
+nvstat/legacy/nvtemp
+nvstat/legacy/nvmon
+nvstat/legacy/nvdump
+nvstat/legacy/nvdump2
+nvstat/legacy/nvi2c
+nvstat/legacy/nvinv
+nvstat/legacy/nvprobe2
+nvstat/legacy/nvrusd
+nvstat/legacy/nvrusd2
+nvstat/legacy/nvrusd3
+nmprobe/gpu_spin
+
+# ── 编辑器 / 临时文件 ──
+*.swp
+*~
+.idea/
+.vscode/
