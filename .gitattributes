@@ -1,0 +1,17 @@
+# 统一换行：仓库内一律 LF
+* text=auto eol=lf
+
+*.c          text eol=lf
+*.cpp        text eol=lf
+*.h          text eol=lf
+*.sh         text eol=lf
+*.md         text eol=lf
+*.plist      text eol=lf
+*.json       text eol=lf
+.gitignore   text eol=lf
+.gitattributes text eol=lf
+
+# 二进制
+*.zip   binary
+*.kext  binary
+*.png   binary
