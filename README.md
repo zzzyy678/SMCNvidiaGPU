@@ -66,8 +66,13 @@ RTX 5080（GB203），macOS 26.7.1，[NullMoth 驱动](https://github.com/nullmo
 | 2.7.0 | 未测试 | — |
 | 2.7.1 | ✅ | 2.7.1 |
 | 2.7.2 | ✅ | 2.7.2 |
+| 2.8 | ✅ | 2.8 |
 
 **✅** = 实测能用；**未测试** = 升级时跳过、未实测。
+
+> 2.8（NVIDIA 620.70.06）的绑定表由社区在 RTX 5060 Laptop（GB206）、macOS 26.7.1 上实测；加进
+> `bindings_archive/` 是为了让在旧驱动上构建的 kext 通过回退表在 2.8 上也能取到温度/功耗，而不会出现
+> `matches none of the known builds`（传感器全 0）。
 
 驱动 **2.7.2** 出于安全考虑不再把内核地址写成 `phys-for-va` 属性（任何程序都能读到）。本 kext **1.8 起**
 改用驱动留给内核客户端的 `nvDisplayPointers` 平台函数取地址，并保留两条兜底路径；1.7 及更早的 kext
