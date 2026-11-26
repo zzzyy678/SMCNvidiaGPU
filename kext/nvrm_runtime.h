@@ -139,7 +139,9 @@ static bool nvrm_runtime_resolve(nvrt_read_fn rd, void *ctx, nvrt_alloc_fn alloc
         }
         at += lc->cmdsize;
     }
-    if (!nsyms || !strsize || nsyms > 0x200000 || strsize > 0x2000000)
+    /* 3.1 has 34,448 symbols (538 KB of nlist_64) and a 1.17 MB string table; these caps leave an order of
+     * magnitude of headroom while bounding what a replaced file can make the kernel allocate (20 MB). */
+    if (!nsyms || !strsize || nsyms > 0x100000 || strsize > 0x400000)
         NVRT_FAIL("driver has no usable symbol table");
     /* The offsets the kext uses are image (vm) offsets; file offsets equal them in __TEXT only when the
      * segment starts at 0 in both, which is how every NVRM build so far has been laid out. */
