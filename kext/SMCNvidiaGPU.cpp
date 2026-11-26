@@ -639,6 +639,18 @@ static bool nvrm_locate_driver(void)
     return true;
 }
 
+/* One fallback table as an NvrmTable, field offsets included. Both the checked and the forced path go
+ * through here, so neither can leave the OBJGPU offsets at zero. */
+static NvrmTable nvrm_legacy_table(const NvrmLegacyBinding &l)
+{
+    NvrmTable t = { l.label, l.anchorOff, l.sigAnchor, l.gpuOff, l.sigGpu, l.createOff, l.sigCreate,
+                    l.linkOff, l.sigLink, l.lockOff, l.sigLock, l.unlockOff, l.sigUnlock,
+                    l.pmInOff, l.sigPmIn, l.pmOutOff, l.sigPmOut,
+                    l.offClient, l.offSubdevice, l.offPhysRmapi, l.offRmapiControl,
+                    l.offUsdMemdesc, l.offUsdMapbuffer, l.offUsdData };
+    return t;
+}
+
 /* Where a table's anchor should be, given whichever address we managed to find. */
 static UInt64 nvrm_anchor_for(const NvrmTable &t)
 {
@@ -764,11 +776,7 @@ static bool nvrm_bind(void)
         return false;   /* driver file not readable yet: retry on the next tick before giving up */
     for (int i = 0; i < kLegacyBindingCount; i++) {
         const NvrmLegacyBinding &l = kLegacyBindings[i];
-        NvrmTable t = { l.label, l.anchorOff, l.sigAnchor, l.gpuOff, l.sigGpu, l.createOff, l.sigCreate,
-                        l.linkOff, l.sigLink, l.lockOff, l.sigLock, l.unlockOff, l.sigUnlock,
-                        l.pmInOff, l.sigPmIn, l.pmOutOff, l.sigPmOut,
-                        l.offClient, l.offSubdevice, l.offPhysRmapi, l.offRmapiControl,
-                        l.offUsdMemdesc, l.offUsdMapbuffer, l.offUsdData };
+        const NvrmTable t = nvrm_legacy_table(l);
         if (nvrm_apply_table(nvrm_anchor_for(t), t)) {
             nvgpulayout = 1;
             SMCNVG_LOG("bound NVRM %s at 0x%llx (legacy table)", l.label, (unsigned long long)gNvrmBase);
@@ -786,9 +794,7 @@ static bool nvrm_bind(void)
         }
         for (int i = 0; !used && i < kLegacyBindingCount; i++) {
             const NvrmLegacyBinding &l = kLegacyBindings[i];
-            NvrmTable t = { l.label, l.anchorOff, l.sigAnchor, l.gpuOff, l.sigGpu, l.createOff, l.sigCreate,
-                            l.linkOff, l.sigLink, l.lockOff, l.sigLock, l.unlockOff, l.sigUnlock,
-                            l.pmInOff, l.sigPmIn, l.pmOutOff, l.sigPmOut };
+            const NvrmTable t = nvrm_legacy_table(l);
             if (!gNvrmBaseKnown && sig_matches_anchor_relaxed(anchor, l.sigAnchor)) {
                 nvrm_apply_table_forced(anchor, t);
                 nvsens_state_set("forced binding 0x%llx, table %s (nvsmcforce=1)",
