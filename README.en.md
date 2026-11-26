@@ -9,12 +9,17 @@ Scripts and other tools can read the sysctls directly (none of this goes into SM
 |---|---|
 | `kern.nvgputemp` `nvgpupower` `nvgpufan` `nvgutil` | temperature, average power, fan RPM, utilisation |
 | `kern.nvgvramused` `nvgvramtotal` | VRAM used / total (MB) |
-| `kern.nvggpcclk` `nvgdramclk` `nvgpstate` | core clock, memory clock, p-state |
+| `kern.nvggpcclk` `nvgdramclk` | core clock, memory clock (MHz) |
+| `kern.nvgpstate` | current P-state as a number: 0 = P0, 8 = P8. Up to 2.3 this was the driver's raw bitmask (P0 = `0x1`, P8 = `0x100`) |
+| `kern.nvgpstateidx` | always 1, meaning `nvgpstate` is a number; builds without this key publish the bitmask |
 | `kern.nvgutilfb` `nvgutilenc` `nvgutildec` | memory-bandwidth / encoder / decoder utilisation |
 | `kern.nvgpuprocpid0..4` `nvgpuprocutil0..4` `nvgpuprocraw0..4` | busiest GPU processes (pid, integer %, raw ×100) |
 | `kern.nvgpudiscover` | how the driver was located (`via=property/platform`, scan result, agreement) |
 | `kern.nvgpuvramtemp` | VRAM temperature in °C (0 when the card reports none) |
 | `kern.nvgputhermstat` `nvgputhermcount` `nvgputhermraw` | driver-side thermal sensor probe |
+
+Scripts that read `nvgpstate` the old way (treating `0x1` as P0) should check `kern.nvgpstateidx` first: if it
+exists and is 1, use the value as is; otherwise take the position of the lowest set bit.
 
 `nvgputhermstat` is 1 when the driver accepted the thermal query and `nvgputhermcount` is the sensor count
 (1 on this GB203: the GPU sensor only).
@@ -100,6 +105,8 @@ Driver builds tested on an RTX 5080 (GB203) with the
 | 2.9 | ✅ | 2.9 |
 | 3.0 | ✅ | 3.0 |
 | 3.1 | ✅ | 3.1 |
+| 3.0.3-nvk (HighDelay) | ✅ (RTX 2080) | 3.0.3-nvk |
+| 3.0.4-nvk (HighDelay) | untested | 3.0.4-nvk |
 
 Upstream 2.8.1 keeps the exact code layout of 2.8 (every entry signature is byte-identical), so both use the
 2.8 table. [GeekAudio v2.8.1-geekaudio.1-rc3](https://github.com/GeekAudio/nvidia-macos-driver/releases/tag/v2.8.1-geekaudio.1-rc3)
@@ -162,10 +169,22 @@ sudo shutdown -r now
 Uninstall with `sudo ./install.sh --uninstall`. If the machine no longer boots, add `nvsensoff=1` to
 boot-args.
 
-Driver updates change the kernel offsets, so the binding table has to be regenerated from the installed NVRM
-and the kext reinstalled. The kext ships binding tables for several driver builds, each carrying its own
-`OBJGPU` field offsets, so an older driver keeps working; when a build has no table yet, the `nvsmcforce=1` boot argument binds anyway, skipping the signature
-check (wrong addresses can panic the kernel, so it is a last resort). Building needs the VirtualSMC and Lilu sources:
+Driver updates change the kernel offsets. The kext ships binding tables for several driver builds, each carrying
+its own `OBJGPU` field offsets, so an older driver keeps working. When a build has no table yet, the kext reads the
+symbol table of the installed `NVRM.kext` from disk at boot and works the offsets out itself, the same way
+`nvrm_bindings.py` does. It only binds if the start of every function it found, and every instruction a field
+offset was read from, match the code that is actually loaded, so a driver update keeps working without a rebuild
+(`kern.nvgpustate` says why when it does not). The compiled-in tables always come first; the disk is only read when
+none of them matches.
+
+The kext looks in `/Library/Extensions/NVRM.kext` and then `/System/Library/Extensions/NVRM.kext`. A driver injected
+from the EFI partition by OpenCore cannot be read at that point in boot, so auto-binding does not kick in there and
+only the compiled-in tables apply; copy the same `NVRM` binary to the system volume and point `nvrmpath=` at it.
+`tools/test/run.sh [NVRM]` runs the same resolver in user space on any driver binary and compares every value with
+what `nvrm_bindings.py` produces.
+
+As a last resort the
+`nvsmcforce=1` boot argument binds anyway, skipping the signature check (wrong addresses can panic the kernel). Building needs the VirtualSMC and Lilu sources:
 
 ```bash
 VSMCDIR=/path/to/VirtualSMC LILUDIR=/path/to/Lilu/Lilu kext/build.sh              # release
@@ -178,6 +197,10 @@ Add these to OpenCore's `boot-args`:
 
 - `nvsmcforce=1`: bind even when no signature matches after a driver update — the entry checks are skipped and
   the closest table is picked by its anchor. Wrong addresses can panic the kernel, so it is a last resort.
+- `nvrmpath=/absolute/path/to/NVRM`: when no compiled-in table matches, read the driver layout from this file
+  instead of the default locations. Use it when the driver is not in `/Library/Extensions`, e.g. injected from
+  EFI: put a copy of the same `NVRM` binary on the system volume and point at it. A file that does not match the
+  loaded driver is refused.
 - `nvsensoff=1`: the kext loads but never touches the driver.
 
 ## Verify

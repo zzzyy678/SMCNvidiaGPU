@@ -78,6 +78,8 @@ macOS 27 尚未支持：只在 macOS 15 / 26 上验证过，升级到 27 后 kex
 | 2.9 | ✅ | 2.9 |
 | 3.0 | ✅ | 3.0 |
 | 3.1 | ✅ | 3.1 |
+| 3.0.3-nvk（HighDelay） | ✅（RTX 2080） | 3.0.3-nvk |
+| 3.0.4-nvk（HighDelay） | 未测试 | 3.0.4-nvk |
 
 **✅** = 实测能用；**未测试** = 升级时跳过、未实测。
 
@@ -134,8 +136,15 @@ sudo shutdown -r now
 
 卸载：`sudo ./install.sh --uninstall`。若装完无法开机，在 boot-args 加 `nvsensoff=1`。
 
-驱动更新会改变内核偏移，需要按本机 NVRM 重新生成绑定表并重装。kext 内置多个驱动版本的绑定表，
-每张表带着该版本自己的 `OBJGPU` 字段偏移，所以旧版本驱动仍然可用；如果某个版本没有对应的表，可以用启动参数 `nvsmcforce=1` 强制绑定
+驱动更新会改变内核偏移。kext 内置多个驱动版本的绑定表，每张表带着该版本自己的 `OBJGPU` 字段偏移，所以旧版本驱动仍然可用；
+如果某个版本还没有对应的表，kext 会在开机时从磁盘读取已安装 `NVRM.kext` 的符号表，用与 `nvrm_bindings.py` 相同的方法自行算出偏移，
+并且只有在每个函数的开头、以及每条取出字段偏移的指令都与内存中实际加载的代码一致时才绑定，因此驱动更新后无需重新编译
+（失败原因见 `kern.nvgpustate`）。内置表总是优先，读盘只在没有任何表匹配时进行。
+
+kext 依次查找 `/Library/Extensions/NVRM.kext` 和 `/System/Library/Extensions/NVRM.kext`。用 OpenCore 从 EFI 注入驱动时，
+内核在这个阶段读不到 EFI 分区，自动适配不会生效，只能靠内置表；这种情况可以把同一个 `NVRM` 二进制复制到系统盘，
+再用启动参数 `nvrmpath=` 指向它。`tools/test/run.sh [NVRM]` 可以在用户态对任意驱动二进制跑同一套解析，并与 `nvrm_bindings.py` 的结果逐项对比。
+最后的手段是启动参数 `nvsmcforce=1` 强制绑定
 （跳过签名校验，地址不匹配时可能导致内核崩溃，仅在拿不到传感器时临时尝试）。编译依赖 VirtualSMC 与 Lilu 的源码：
 
 ```bash
@@ -149,6 +158,8 @@ MODE=debug VSMCDIR=/path/to/VirtualSMC LILUDIR=/path/to/Lilu/Lilu kext/build.sh 
 
 - `nvsmcforce=1`：驱动更新后没有匹配的签名也强制绑定，跳过入口校验、按锚点选最接近的一套表；
   地址不对可能导致内核崩溃，仅在读不到传感器时临时用。
+- `nvrmpath=/绝对路径/NVRM`：没有内置表匹配时，从这个文件（而不是默认位置）读取驱动布局。驱动不在 `/Library/Extensions` 时使用，
+  例如从 EFI 注入的驱动：把同一个 `NVRM` 二进制放到系统盘上再指向它。文件与实际加载的驱动不一致时不会绑定。
 - `nvsensoff=1`：让 kext 完全不碰驱动，只加载不读取。
 
 ## 验证
@@ -187,12 +198,16 @@ iStat Menus 的 GPU 面板会把百分比键当成独立记录多显示一条风
 |---|---|
 | `kern.nvgputemp` `nvgpupower` `nvgpufan` `nvgutil` | 温度、平均功耗、风扇转速、利用率 |
 | `kern.nvgvramused` `nvgvramtotal` | 显存已用 / 总量（MB） |
-| `kern.nvggpcclk` `nvgdramclk` `nvgpstate` | 核心频率、显存频率、P-State |
+| `kern.nvggpcclk` `nvgdramclk` | 核心频率、显存频率（MHz） |
+| `kern.nvgpstate` | 当前 P-State 的序号：0 = P0，8 = P8。2.3 及以前发布的是驱动原样返回的位掩码（P0 = `0x1`，P8 = `0x100`） |
+| `kern.nvgpstateidx` | 恒为 1，表示 `nvgpstate` 是序号；不存在这个键的旧版本发布的是位掩码 |
 | `kern.nvgutilfb` `nvgutilenc` `nvgutildec` | 显存带宽 / 编码 / 解码利用率 |
 | `kern.nvgpuprocpid0..4` `nvgpuprocutil0..4` `nvgpuprocraw0..4` | 占用最高的几个进程（PID、整数百分比、×100 原始值） |
 | `kern.nvgpuvramtemp` | 显存温度（°C，显卡不上报时为 0） |
 | `kern.nvgputhermstat` `nvgputhermcount` `nvgputhermraw` | 驱动侧热传感器探测结果 |
 | `kern.nvgpudiscover` | 驱动的定位方式（`via=property/platform`、扫描结果、是否一致） |
+
+按旧语义读 `nvgpstate` 的脚本（例如把 `0x1` 当 P0）需要先查 `kern.nvgpstateidx`：存在且为 1 时直接当序号用，否则按位掩码取最低位的位置。
 
 `nvgputhermstat` 为 1 表示驱动接受了热传感器查询，`nvgputhermcount` 是传感器数量（本机 GB203 为 1，只有 GPU 温度）。
 

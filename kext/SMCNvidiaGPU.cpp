@@ -49,8 +49,22 @@
 #include <VirtualSMCSDK/kern_vsmcapi.hpp>
 #include <Headers/kern_util.hpp>
 
+#include <mach-o/nlist.h>
+#include <sys/vnode.h>
+#include <Headers/kern_file.hpp>
+
 #include "nvrm_bindings.h"
 #include "nvrm_bindings_legacy.h"
+#include "nvrm_runtime.h"
+
+/* Where the installed driver may live; read at boot when no compiled-in table matches it. The installer
+ * uses the first one. A driver injected by OpenCore lives on the EFI partition, which the kernel cannot read
+ * at that point: point nvrmpath= at a copy of that NVRM binary on the system volume, or rely on the tables. */
+static const char *const kNvrmDriverPaths[] = {
+    "/Library/Extensions/NVRM.kext/Contents/MacOS/NVRM",
+    "/System/Library/Extensions/NVRM.kext/Contents/MacOS/NVRM",
+};
+static char gNvrmPathArg[256];   /* nvrmpath= boot argument: the only candidate when set */
 
 #define SMCNVG_LOG(fmt, ...) do { IOLog("SMCNvidiaGPU: " fmt "\n", ##__VA_ARGS__); } while (0)
 
@@ -167,6 +181,9 @@ SYSCTL_INT(_kern, OID_AUTO, nvgutilofa, CTLFLAG_RW, &nvgutilofa, 0, "NVIDIA GPU 
 SYSCTL_INT(_kern, OID_AUTO, nvgvramtotal, CTLFLAG_RW, &nvgvramtotal, 0, "NVIDIA GPU VRAM total MB");
 SYSCTL_INT(_kern, OID_AUTO, nvgvramused, CTLFLAG_RW, &nvgvramused, 0, "NVIDIA GPU VRAM used MB");
 SYSCTL_INT(_kern, OID_AUTO, nvgpstate, CTLFLAG_RW, &nvgpstate, 0, "NVIDIA GPU current P-state");
+/* Present only in builds that publish nvgpstate as a number (0 = P0); older builds published RM's bitmask. */
+static int nvgpstateidx = 1;
+SYSCTL_INT(_kern, OID_AUTO, nvgpstateidx, CTLFLAG_RD, &nvgpstateidx, 0, "nvgpstate is an index (1), not a bitmask");
 
 SYSCTL_INT(_kern, OID_AUTO, nvgpupower, CTLFLAG_RD, &nvgpupower, 0, "NVIDIA GPU average power mW (RUSD)");
 SYSCTL_INT(_kern, OID_AUTO, nvgpupower_mod, CTLFLAG_RD, &nvgpupower_mod, 0, "NVIDIA GPU module power mW (RUSD)");
@@ -305,6 +322,8 @@ SYSCTL_STRING(_kern, OID_AUTO, nvgpustate, CTLFLAG_RD, nvgpustate, sizeof(nvgpus
 #define RUSD_TEMP_STRIDE 16u
 #define RUSD_FAN_MAX_COOLERS 16u
 #define RUSD_CLK_DOMAIN_GRAPHICS 0u
+#define RUSD_CLK_DOMAIN_MEMORY 1u
+#define RUSD_CLK_DOMAIN_VIDEO 2u
 #define RUSD_CLK_DOMAIN_SM 3u
 
 #define RUSD_TIMESTAMP_INVALID 0ull
@@ -626,10 +645,155 @@ static bool nvrm_locate_driver(void)
     return true;
 }
 
+/* One fallback table as an NvrmTable, field offsets included. Both the checked and the forced path go
+ * through here, so neither can leave the OBJGPU offsets at zero. */
+static NvrmTable nvrm_legacy_table(const NvrmLegacyBinding &l)
+{
+    NvrmTable t = { l.label, l.anchorOff, l.sigAnchor, l.gpuOff, l.sigGpu, l.createOff, l.sigCreate,
+                    l.linkOff, l.sigLink, l.lockOff, l.sigLock, l.unlockOff, l.sigUnlock,
+                    l.pmInOff, l.sigPmIn, l.pmOutOff, l.sigPmOut,
+                    l.offClient, l.offSubdevice, l.offPhysRmapi, l.offRmapiControl,
+                    l.offUsdMemdesc, l.offUsdMapbuffer, l.offUsdData };
+    return t;
+}
+
 /* Where a table's anchor should be, given whichever address we managed to find. */
 static UInt64 nvrm_anchor_for(const NvrmTable &t)
 {
     return gNvrmBaseKnown ? gNvrmBase + t.anchorOff : gNvrmAnchor;
+}
+
+/* ---- binding from the driver on disk (any driver build) -------------------------------------------- */
+
+struct NvrtFile { vnode_t vp; vfs_context_t ctx; };
+
+static bool nvrt_kread(void *c, UInt64 off, void *buf, size_t len)
+{
+    NvrtFile *f = (NvrtFile *)c;
+    return FileIO::readFileData(buf, (off_t)off, len, f->vp, f->ctx) == 0;
+}
+static void *nvrt_kalloc(size_t len) { return IOMalloc(len); }
+static void nvrt_kfree(void *p, size_t len) { IOFree(p, len); }
+
+static bool gRuntimeTried;
+static unsigned gRuntimeOpenTries;
+static char gRuntimeWhy[128];
+static char gRuntimePath[256];
+
+static bool nvrm_runtime_install(NvrmRuntime *rt);
+
+/* 1 bound, 0 opened but refused (gRuntimeWhy says why), -1 could not open (errno in *err). */
+static int nvrm_bind_runtime_from(const char *path, int *err)
+{
+    NvrtFile f = { nullptr, vfs_context_create(nullptr) };
+    if (!f.ctx) {
+        *err = ENOMEM;
+        return -1;
+    }
+    *err = vnode_lookup(path, 0, &f.vp, f.ctx);
+    if (*err) {
+        vfs_context_rele(f.ctx);
+        return -1;
+    }
+    NvrmRuntime *rt = (NvrmRuntime *)IOMalloc(sizeof(NvrmRuntime));
+    bool ok = rt && nvrm_runtime_resolve(nvrt_kread, &f, nvrt_kalloc, nvrt_kfree, rt);
+    vnode_put(f.vp);
+    vfs_context_rele(f.ctx);
+    if (!ok)
+        snprintf(gRuntimeWhy, sizeof gRuntimeWhy, "%s", rt ? rt->why : "out of memory");
+    else
+        ok = nvrm_runtime_install(rt);
+    if (rt)
+        IOFree(rt, sizeof(NvrmRuntime));
+    if (ok)
+        snprintf(gRuntimePath, sizeof gRuntimePath, "%s", path);
+    return ok ? 1 : 0;
+}
+
+/* Read NVRM's symbol table from disk, then install the result only if the first bytes of every function
+ * the file names, and every instruction a field offset came from, are the bytes loaded at base + offset.
+ * A driver replaced on disk but not yet reloaded fails that check, so nothing is ever called or read on the
+ * strength of the file alone. Each candidate path is tried in turn; a stale copy at one of them is refused
+ * by that check and the next one gets its chance. */
+static bool nvrm_bind_runtime(void)
+{
+    if (gRuntimeTried)
+        return false;
+    if (!gNvrmAnchor && !gNvrmBaseKnown)
+        return false;
+
+    const char *one[1] = { gNvrmPathArg };
+    const char *const *paths = gNvrmPathArg[0] ? one : kNvrmDriverPaths;
+    const unsigned n = gNvrmPathArg[0] ? 1u : (unsigned)(sizeof kNvrmDriverPaths / sizeof kNvrmDriverPaths[0]);
+    bool opened = false;
+    int lastErr = 0;
+    for (unsigned i = 0; i < n; i++) {
+        int err = 0;
+        int r = nvrm_bind_runtime_from(paths[i], &err);
+        if (r == 1) {
+            gRuntimeTried = true;
+            return true;
+        }
+        if (r == 0)
+            opened = true;
+        else
+            lastErr = err;
+    }
+    if (opened) {
+        gRuntimeTried = true;
+        return false;
+    }
+    /* The root volume may not be ready yet on an early tick: try again for about a minute. */
+    snprintf(gRuntimeWhy, sizeof gRuntimeWhy, "cannot open the driver file%s (%d)",
+             gNvrmPathArg[0] ? " given by nvrmpath=" : "", lastErr);
+    if (++gRuntimeOpenTries >= 120)
+        gRuntimeTried = true;
+    return false;
+}
+
+/* Check a resolved layout against the loaded code and, if it is the same driver, install it. */
+static bool nvrm_runtime_install(NvrmRuntime *rt)
+{
+    const UInt64 base = gNvrmBaseKnown ? gNvrmBase : gNvrmAnchor - rt->off[NVRT_ANCHOR];
+    for (unsigned k = 0; k < NVRT_COUNT; k++) {
+        if (!sig_matches(base + rt->off[k], rt->sig[k])) {
+            /* The anchor is checked first: if it differs, the loaded driver is not the file's and no other
+             * address derived from the file is touched. */
+            snprintf(gRuntimeWhy, sizeof gRuntimeWhy, "loaded driver differs from the one on disk (%s); reboot",
+                     kNvrtSymbols[k] + 1);
+            return false;
+        }
+    }
+    /* Matching prologues are not enough: two builds can start their functions identically while OBJGPU's
+     * layout moved. Every field offset was read out of one instruction, so that instruction, displacement
+     * included, must be in the loaded code at the same place. Each site lies inside a function whose start
+     * just matched, before the next symbol, so the read stays inside the loaded image. */
+    for (unsigned k = 0; k < NVRT_SITES; k++) {
+        const NvrtSite &s = rt->site[k];
+        if (!s.len || memcmp((const void *)(uintptr_t)(base + s.off), s.bytes, s.len) != 0) {
+            snprintf(gRuntimeWhy, sizeof gRuntimeWhy,
+                     "loaded driver uses different OBJGPU offsets than the one on disk (+%#llx); reboot",
+                     (unsigned long long)s.off);
+            return false;
+        }
+    }
+
+    gApi.gpu = (void *(*)(unsigned int))(uintptr_t)(base + rt->off[NVRT_GPU]);
+    gApi.createRusd = (int (*)(void *))(uintptr_t)(base + rt->off[NVRT_CREATE]);
+    gApi.linkRusd = (int (*)(void *))(uintptr_t)(base + rt->off[NVRT_LINK]);
+    gApi.lock = (int (*)(unsigned int, unsigned int))(uintptr_t)(base + rt->off[NVRT_LOCK]);
+    gApi.unlock = (void (*)(void))(uintptr_t)(base + rt->off[NVRT_UNLOCK]);
+    gApi.pmEnter = (int (*)(void))(uintptr_t)(base + rt->off[NVRT_PMIN]);
+    gApi.pmExit = (void (*)(int))(uintptr_t)(base + rt->off[NVRT_PMOUT]);
+    gOffClient = rt->hClient;
+    gOffSubdevice = rt->hSubdevice;
+    gOffPhysRmapi = rt->physicalRmApi;
+    gOffRmapiControl = rt->rmapiControl;
+    gOffUsdMemdesc = rt->usdMemDesc;
+    gOffUsdMapbuffer = rt->usdMapBuffer;
+    gOffUsdData = rt->usdData;
+    gNvrmBase = base;
+    return true;
 }
 
 static bool nvrm_bind(void)
@@ -644,13 +808,11 @@ static bool nvrm_bind(void)
         nvsens_state_set("bound NVRM 0x%llx", (unsigned long long)gNvrmBase);
         return true;
     }
+    /* Compiled-in tables were generated and signature-checked for exactly one build each: they always win,
+     * and need nothing from disk, so they bind on the first tick. */
     for (int i = 0; i < kLegacyBindingCount; i++) {
         const NvrmLegacyBinding &l = kLegacyBindings[i];
-        NvrmTable t = { l.label, l.anchorOff, l.sigAnchor, l.gpuOff, l.sigGpu, l.createOff, l.sigCreate,
-                        l.linkOff, l.sigLink, l.lockOff, l.sigLock, l.unlockOff, l.sigUnlock,
-                        l.pmInOff, l.sigPmIn, l.pmOutOff, l.sigPmOut,
-                        l.offClient, l.offSubdevice, l.offPhysRmapi, l.offRmapiControl,
-                        l.offUsdMemdesc, l.offUsdMapbuffer, l.offUsdData };
+        const NvrmTable t = nvrm_legacy_table(l);
         if (nvrm_apply_table(nvrm_anchor_for(t), t)) {
             nvgpulayout = 1;
             SMCNVG_LOG("bound NVRM %s at 0x%llx (legacy table)", l.label, (unsigned long long)gNvrmBase);
@@ -658,6 +820,15 @@ static bool nvrm_bind(void)
             return true;
         }
     }
+    /* A driver no table knows: read its layout from disk instead of needing a rebuild. */
+    if (nvrm_bind_runtime()) {
+        nvgpulayout = 1;
+        SMCNVG_LOG("bound NVRM at 0x%llx from %s", (unsigned long long)gNvrmBase, gRuntimePath);
+        nvsens_state_set("bound NVRM 0x%llx (layout read from %s)", (unsigned long long)gNvrmBase, gRuntimePath);
+        return true;
+    }
+    if (!gRuntimeTried)
+        return false;   /* driver file not readable yet: retry on the next tick before forcing or giving up */
     if (nvgpufForceArg) {
         /* Pick the table whose anchor still lines up apart from the displacement bytes, so the entry
          * offsets come from the build that is actually installed; fall back to the current table. */
@@ -668,9 +839,7 @@ static bool nvrm_bind(void)
         }
         for (int i = 0; !used && i < kLegacyBindingCount; i++) {
             const NvrmLegacyBinding &l = kLegacyBindings[i];
-            NvrmTable t = { l.label, l.anchorOff, l.sigAnchor, l.gpuOff, l.sigGpu, l.createOff, l.sigCreate,
-                            l.linkOff, l.sigLink, l.lockOff, l.sigLock, l.unlockOff, l.sigUnlock,
-                            l.pmInOff, l.sigPmIn, l.pmOutOff, l.sigPmOut };
+            const NvrmTable t = nvrm_legacy_table(l);
             if (!gNvrmBaseKnown && sig_matches_anchor_relaxed(anchor, l.sigAnchor)) {
                 nvrm_apply_table_forced(anchor, t);
                 nvsens_state_set("forced binding 0x%llx, table %s (nvsmcforce=1)",
@@ -688,8 +857,9 @@ static bool nvrm_bind(void)
                    (unsigned long long)gNvrmBase);
         return true;
     }
-    nvsens_state_set("NVRM at 0x%llx matches none of the %d known builds (nvsmcforce=1 to try anyway)",
-                     (unsigned long long)(anchor - kCurrentTable.anchorOff), kLegacyBindingCount + 1);
+    nvsens_state_set("NVRM at 0x%llx matches none of the %d known builds and %s",
+                     (unsigned long long)(anchor - kCurrentTable.anchorOff), kLegacyBindingCount + 1,
+                     gRuntimeWhy[0] ? gRuntimeWhy : "could not be read from disk");
     return false;
 }
 /* Run one RM operation with the GPU kept awake and the API lock held. */
@@ -866,6 +1036,7 @@ void SMCNvidiaGPU::registerSysctls()
     sysctl_register_oid(&sysctl__kern_nvgvramtotal);
     sysctl_register_oid(&sysctl__kern_nvgvramused);
     sysctl_register_oid(&sysctl__kern_nvgpstate);
+    sysctl_register_oid(&sysctl__kern_nvgpstateidx);
     sysctl_register_oid(&sysctl__kern_nvgpupower);
     sysctl_register_oid(&sysctl__kern_nvgpupower_mod);
     sysctl_register_oid(&sysctl__kern_nvgpupower_mem);
@@ -981,6 +1152,7 @@ void SMCNvidiaGPU::unregisterSysctls()
     sysctl_unregister_oid(&sysctl__kern_nvgvramtotal);
     sysctl_unregister_oid(&sysctl__kern_nvgvramused);
     sysctl_unregister_oid(&sysctl__kern_nvgpstate);
+    sysctl_unregister_oid(&sysctl__kern_nvgpstateidx);
     sysctl_unregister_oid(&sysctl__kern_nvgpupower);
     sysctl_unregister_oid(&sysctl__kern_nvgpupower_mod);
     sysctl_unregister_oid(&sysctl__kern_nvgpupower_mem);
@@ -1443,6 +1615,10 @@ static void nvsmc_rm_thermal_probe(void *pGpu)
     }
 }
 
+/* Set once the PMUMON clock queue has delivered a sample. Turing (and older) never fills that queue, so the
+ * core/memory/NVD clocks are then taken from the RUSD public clock domains instead. */
+static bool gPmumonClocks = false;
+
 static bool nvsmc_rm_clocks(void *pGpu)
 {
     memset(&gClkParams, 0, sizeof gClkParams);
@@ -1457,6 +1633,7 @@ static bool nvsmc_rm_clocks(void *pGpu)
     nvgdramclk = (int)(x.dramKHz / 1000);
     nvgnvdclk = (int)(x.nvdKHz / 1000);
     nvgactivegpc = (int)(x.activeGpcKHz / 1000);
+    gPmumonClocks = true;
     return true;
 }
 
@@ -1590,7 +1767,10 @@ static bool nvsmc_rm_pstate(void *pGpu)
     UInt32 ps = 0;
     if (!nvsmc_rm_call_gpu(pGpu, 0x20802068u, &ps, sizeof ps, nullptr))
         return false;
-    nvgpstate = (int)ps;
+    /* RM answers with a one-bit mask (NV2080_CTRL_PERF_PSTATES_P0 = 0x1 ... P15 = 0x8000), not a number. */
+    if (ps == 0 || (ps & (ps - 1)))
+        return false;
+    nvgpstate = __builtin_ctz(ps);
     return true;
 }
 
@@ -1695,6 +1875,13 @@ void SMCNvidiaGPU::readRusd()
         UInt32 smKHz = clk.info[RUSD_CLK_DOMAIN_SM * 2 + 1];
         if (gfxKHz && gfxKHz < 10000000u) nvgpugfxclk = (int)(gfxKHz / 1000u);
         if (smKHz && smKHz < 10000000u) nvgpusmclk = (int)(smKHz / 1000u);
+        if (!gPmumonClocks) {
+            UInt32 memKHz = clk.info[RUSD_CLK_DOMAIN_MEMORY * 2 + 1];
+            UInt32 vidKHz = clk.info[RUSD_CLK_DOMAIN_VIDEO * 2 + 1];
+            if (gfxKHz < 10000000u) nvggpcclk = (int)(gfxKHz / 1000u);
+            if (memKHz < 20000000u) nvgdramclk = (int)(memKHz / 1000u);
+            if (vidKHz < 10000000u) nvgnvdclk = (int)(vidKHz / 1000u);
+        }
     }
     for (int i = 0; i < 5; i++) {
         struct { UInt64 ts; SInt32 temp; UInt32 pad; } temp;
@@ -2175,6 +2362,14 @@ bool SMCNvidiaGPU::start(IOService *provider)
     if (PE_parse_boot_argn("nvsmcforce", &forced, sizeof(forced)) && forced != 0) {
         nvgpufForceArg = forced;
         SMCNVG_LOG("nvsmcforce=%d boot argument: will bind even without a signature match", forced);
+    }
+    if (PE_parse_boot_argn("nvrmpath", gNvrmPathArg, sizeof(gNvrmPathArg))) {
+        if (gNvrmPathArg[0] != '/') {
+            SMCNVG_LOG("nvrmpath= must be an absolute path; ignored");
+            gNvrmPathArg[0] = 0;
+        } else {
+            SMCNVG_LOG("nvrmpath=%s boot argument: reading the driver layout from there", gNvrmPathArg);
+        }
     }
     if (PE_parse_boot_argn("nvsensoff", &off, sizeof(off)) && off != 0) {
         SMCNVG_LOG("nvsensoff=%d boot argument: staying out of the way", off);
