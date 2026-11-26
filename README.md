@@ -187,12 +187,16 @@ iStat Menus 的 GPU 面板会把百分比键当成独立记录多显示一条风
 |---|---|
 | `kern.nvgputemp` `nvgpupower` `nvgpufan` `nvgutil` | 温度、平均功耗、风扇转速、利用率 |
 | `kern.nvgvramused` `nvgvramtotal` | 显存已用 / 总量（MB） |
-| `kern.nvggpcclk` `nvgdramclk` `nvgpstate` | 核心频率、显存频率、P-State |
+| `kern.nvggpcclk` `nvgdramclk` | 核心频率、显存频率（MHz） |
+| `kern.nvgpstate` | 当前 P-State 的序号：0 = P0，8 = P8。2.3 及以前发布的是驱动原样返回的位掩码（P0 = `0x1`，P8 = `0x100`） |
+| `kern.nvgpstateidx` | 恒为 1，表示 `nvgpstate` 是序号；不存在这个键的旧版本发布的是位掩码 |
 | `kern.nvgutilfb` `nvgutilenc` `nvgutildec` | 显存带宽 / 编码 / 解码利用率 |
 | `kern.nvgpuprocpid0..4` `nvgpuprocutil0..4` `nvgpuprocraw0..4` | 占用最高的几个进程（PID、整数百分比、×100 原始值） |
 | `kern.nvgpuvramtemp` | 显存温度（°C，显卡不上报时为 0） |
 | `kern.nvgputhermstat` `nvgputhermcount` `nvgputhermraw` | 驱动侧热传感器探测结果 |
 | `kern.nvgpudiscover` | 驱动的定位方式（`via=property/platform`、扫描结果、是否一致） |
+
+按旧语义读 `nvgpstate` 的脚本（例如把 `0x1` 当 P0）需要先查 `kern.nvgpstateidx`：存在且为 1 时直接当序号用，否则按位掩码取最低位的位置。
 
 `nvgputhermstat` 为 1 表示驱动接受了热传感器查询，`nvgputhermcount` 是传感器数量（本机 GB203 为 1，只有 GPU 温度）。
 
