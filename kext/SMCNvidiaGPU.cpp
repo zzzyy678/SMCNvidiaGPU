@@ -57,8 +57,14 @@
 #include "nvrm_bindings_legacy.h"
 #include "nvrm_runtime.h"
 
-/* Where the installed driver lives; read at boot when no compiled-in table matches it. */
-#define NVRM_DRIVER_PATH "/Library/Extensions/NVRM.kext/Contents/MacOS/NVRM"
+/* Where the installed driver may live; read at boot when no compiled-in table matches it. The installer
+ * uses the first one. A driver injected by OpenCore lives on the EFI partition, which the kernel cannot read
+ * at that point: point nvrmpath= at a copy of that NVRM binary on the system volume, or rely on the tables. */
+static const char *const kNvrmDriverPaths[] = {
+    "/Library/Extensions/NVRM.kext/Contents/MacOS/NVRM",
+    "/System/Library/Extensions/NVRM.kext/Contents/MacOS/NVRM",
+};
+static char gNvrmPathArg[256];   /* nvrmpath= boot argument: the only candidate when set */
 
 #define SMCNVG_LOG(fmt, ...) do { IOLog("SMCNvidiaGPU: " fmt "\n", ##__VA_ARGS__); } while (0)
 
@@ -671,12 +677,44 @@ static void nvrt_kfree(void *p, size_t len) { IOFree(p, len); }
 
 static bool gRuntimeTried;
 static unsigned gRuntimeOpenTries;
-static char gRuntimeWhy[96];
+static char gRuntimeWhy[128];
+static char gRuntimePath[256];
+
+static bool nvrm_runtime_install(NvrmRuntime *rt);
+
+/* 1 bound, 0 opened but refused (gRuntimeWhy says why), -1 could not open (errno in *err). */
+static int nvrm_bind_runtime_from(const char *path, int *err)
+{
+    NvrtFile f = { nullptr, vfs_context_create(nullptr) };
+    if (!f.ctx) {
+        *err = ENOMEM;
+        return -1;
+    }
+    *err = vnode_lookup(path, 0, &f.vp, f.ctx);
+    if (*err) {
+        vfs_context_rele(f.ctx);
+        return -1;
+    }
+    NvrmRuntime *rt = (NvrmRuntime *)IOMalloc(sizeof(NvrmRuntime));
+    bool ok = rt && nvrm_runtime_resolve(nvrt_kread, &f, nvrt_kalloc, nvrt_kfree, rt);
+    vnode_put(f.vp);
+    vfs_context_rele(f.ctx);
+    if (!ok)
+        snprintf(gRuntimeWhy, sizeof gRuntimeWhy, "%s", rt ? rt->why : "out of memory");
+    else
+        ok = nvrm_runtime_install(rt);
+    if (rt)
+        IOFree(rt, sizeof(NvrmRuntime));
+    if (ok)
+        snprintf(gRuntimePath, sizeof gRuntimePath, "%s", path);
+    return ok ? 1 : 0;
+}
 
 /* Read NVRM's symbol table from disk, then install the result only if the first bytes of every function
  * the file names, and every instruction a field offset came from, are the bytes loaded at base + offset.
  * A driver replaced on disk but not yet reloaded fails that check, so nothing is ever called or read on the
- * strength of the file alone. */
+ * strength of the file alone. Each candidate path is tried in turn; a stale copy at one of them is refused
+ * by that check and the next one gets its chance. */
 static bool nvrm_bind_runtime(void)
 {
     if (gRuntimeTried)
@@ -684,29 +722,38 @@ static bool nvrm_bind_runtime(void)
     if (!gNvrmAnchor && !gNvrmBaseKnown)
         return false;
 
-    NvrtFile f = { nullptr, vfs_context_create(nullptr) };
-    if (!f.ctx)
-        return false;
-    int err = vnode_lookup(NVRM_DRIVER_PATH, 0, &f.vp, f.ctx);
-    if (err) {
-        vfs_context_rele(f.ctx);
-        /* The root volume may not be ready yet on an early tick: try again for about a minute. */
-        snprintf(gRuntimeWhy, sizeof gRuntimeWhy, "cannot open the driver file (%d)", err);
-        if (++gRuntimeOpenTries >= 120)
+    const char *one[1] = { gNvrmPathArg };
+    const char *const *paths = gNvrmPathArg[0] ? one : kNvrmDriverPaths;
+    const unsigned n = gNvrmPathArg[0] ? 1u : (unsigned)(sizeof kNvrmDriverPaths / sizeof kNvrmDriverPaths[0]);
+    bool opened = false;
+    int lastErr = 0;
+    for (unsigned i = 0; i < n; i++) {
+        int err = 0;
+        int r = nvrm_bind_runtime_from(paths[i], &err);
+        if (r == 1) {
             gRuntimeTried = true;
+            return true;
+        }
+        if (r == 0)
+            opened = true;
+        else
+            lastErr = err;
+    }
+    if (opened) {
+        gRuntimeTried = true;
         return false;
     }
-    gRuntimeTried = true;
-    NvrmRuntime *rt = (NvrmRuntime *)IOMalloc(sizeof(NvrmRuntime));
-    bool ok = rt && nvrm_runtime_resolve(nvrt_kread, &f, nvrt_kalloc, nvrt_kfree, rt);
-    vnode_put(f.vp);
-    vfs_context_rele(f.ctx);
-    if (!ok) {
-        snprintf(gRuntimeWhy, sizeof gRuntimeWhy, "%s", rt ? rt->why : "out of memory");
-        if (rt) IOFree(rt, sizeof(NvrmRuntime));
-        return false;
-    }
+    /* The root volume may not be ready yet on an early tick: try again for about a minute. */
+    snprintf(gRuntimeWhy, sizeof gRuntimeWhy, "cannot open the driver file%s (%d)",
+             gNvrmPathArg[0] ? " given by nvrmpath=" : "", lastErr);
+    if (++gRuntimeOpenTries >= 120)
+        gRuntimeTried = true;
+    return false;
+}
 
+/* Check a resolved layout against the loaded code and, if it is the same driver, install it. */
+static bool nvrm_runtime_install(NvrmRuntime *rt)
+{
     const UInt64 base = gNvrmBaseKnown ? gNvrmBase : gNvrmAnchor - rt->off[NVRT_ANCHOR];
     for (unsigned k = 0; k < NVRT_COUNT; k++) {
         if (!sig_matches(base + rt->off[k], rt->sig[k])) {
@@ -714,7 +761,6 @@ static bool nvrm_bind_runtime(void)
              * address derived from the file is touched. */
             snprintf(gRuntimeWhy, sizeof gRuntimeWhy, "loaded driver differs from the one on disk (%s); reboot",
                      kNvrtSymbols[k] + 1);
-            IOFree(rt, sizeof(NvrmRuntime));
             return false;
         }
     }
@@ -728,7 +774,6 @@ static bool nvrm_bind_runtime(void)
             snprintf(gRuntimeWhy, sizeof gRuntimeWhy,
                      "loaded driver uses different OBJGPU offsets than the one on disk (+%#llx); reboot",
                      (unsigned long long)s.off);
-            IOFree(rt, sizeof(NvrmRuntime));
             return false;
         }
     }
@@ -748,7 +793,6 @@ static bool nvrm_bind_runtime(void)
     gOffUsdMapbuffer = rt->usdMapBuffer;
     gOffUsdData = rt->usdData;
     gNvrmBase = base;
-    IOFree(rt, sizeof(NvrmRuntime));
     return true;
 }
 
@@ -779,9 +823,8 @@ static bool nvrm_bind(void)
     /* A driver no table knows: read its layout from disk instead of needing a rebuild. */
     if (nvrm_bind_runtime()) {
         nvgpulayout = 1;
-        SMCNVG_LOG("bound NVRM at 0x%llx from %s", (unsigned long long)gNvrmBase, NVRM_DRIVER_PATH);
-        nvsens_state_set("bound NVRM 0x%llx (layout read from the installed driver)",
-                         (unsigned long long)gNvrmBase);
+        SMCNVG_LOG("bound NVRM at 0x%llx from %s", (unsigned long long)gNvrmBase, gRuntimePath);
+        nvsens_state_set("bound NVRM 0x%llx (layout read from %s)", (unsigned long long)gNvrmBase, gRuntimePath);
         return true;
     }
     if (!gRuntimeTried)
@@ -2319,6 +2362,14 @@ bool SMCNvidiaGPU::start(IOService *provider)
     if (PE_parse_boot_argn("nvsmcforce", &forced, sizeof(forced)) && forced != 0) {
         nvgpufForceArg = forced;
         SMCNVG_LOG("nvsmcforce=%d boot argument: will bind even without a signature match", forced);
+    }
+    if (PE_parse_boot_argn("nvrmpath", gNvrmPathArg, sizeof(gNvrmPathArg))) {
+        if (gNvrmPathArg[0] != '/') {
+            SMCNVG_LOG("nvrmpath= must be an absolute path; ignored");
+            gNvrmPathArg[0] = 0;
+        } else {
+            SMCNVG_LOG("nvrmpath=%s boot argument: reading the driver layout from there", gNvrmPathArg);
+        }
     }
     if (PE_parse_boot_argn("nvsensoff", &off, sizeof(off)) && off != 0) {
         SMCNVG_LOG("nvsensoff=%d boot argument: staying out of the way", off);
