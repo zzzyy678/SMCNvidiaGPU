@@ -8,10 +8,13 @@
  *      exported functions the kext calls (the driver ships unstripped; nm sees them, so can we);
  *   2. decode the OBJGPU field offsets from the two small functions nvrm_bindings.py disassembles, by
  *      matching the same instructions as raw bytes, and run the same consistency checks;
- *   3. hand back offsets plus the first NVRM_RT_SIG_LEN bytes of each function, read from the file.
+ *   3. hand back offsets plus the first NVRM_RT_SIG_LEN bytes of each function, and the exact bytes of
+ *      every instruction a field offset was decoded from, all read from the file.
  *
- * The caller then checks every one of those signatures against the code that is actually loaded before it
+ * The caller then checks every one of those byte runs against the code that is actually loaded before it
  * calls anything, so a driver updated on disk but not yet loaded (no reboot yet) simply does not bind.
+ * Checking the decoded instructions too matters: two builds can share function prologues while their
+ * OBJGPU layout differs, and the field offsets are only trustworthy if the loaded code uses them.
  *
  * Pure C++ with a read callback, so tools/test can run it in user space against the real binary.
  */
@@ -38,10 +41,21 @@ static const char *const kNvrtSymbols[NVRT_COUNT] = {
     "_gpushareddataWriteStart_INTERNAL",
 };
 
+/* One decoded instruction: image offset and its bytes (opcode prefix + 32-bit displacement). None of these
+ * carry relocations (they address registers, not symbols), so the loaded copy must match byte for byte. */
+#define NVRT_SITE_MAX 8u
+enum { NVRT_SITES = 7 };
+struct NvrtSite {
+    UInt64 off;
+    unsigned char len;
+    unsigned char bytes[NVRT_SITE_MAX];
+};
+
 struct NvrmRuntime {
     UInt64 off[NVRT_COUNT];
     unsigned char sig[NVRT_COUNT][NVRM_RT_SIG_LEN];
     UInt32 hClient, hSubdevice, physicalRmApi, rmapiControl, usdMemDesc, usdMapBuffer, usdData;
+    NvrtSite site[NVRT_SITES];
     unsigned char uuid[16];
     bool hasUuid;
     char why[96];   /* set when resolution fails */
@@ -57,21 +71,27 @@ static inline UInt32 nvrt_le32(const unsigned char *p)
     return (UInt32)p[0] | ((UInt32)p[1] << 8) | ((UInt32)p[2] << 16) | ((UInt32)p[3] << 24);
 }
 
-/* Exactly one occurrence of `prefix` followed by a 32-bit displacement in [0, len); returns it in *out. */
-static bool nvrt_find_disp(const unsigned char *code, size_t len, const unsigned char *prefix, size_t plen,
-                           UInt32 *out)
+/* Exactly one occurrence of `prefix` followed by a 32-bit displacement in [0, len); returns it in *out and
+ * records the whole instruction (at image offset funcOff + position) in *site. */
+static bool nvrt_find_disp(const unsigned char *code, size_t len, UInt64 funcOff, const unsigned char *prefix,
+                           size_t plen, UInt32 *out, NvrtSite *site)
 {
     int hits = 0;
-    UInt32 v = 0;
+    size_t at = 0;
+    if (plen + 4 > NVRT_SITE_MAX)
+        return false;
     for (size_t i = 0; i + plen + 4 <= len; i++) {
         if (memcmp(code + i, prefix, plen) == 0) {
-            v = nvrt_le32(code + i + plen);
+            at = i;
             hits++;
         }
     }
     if (hits != 1)
         return false;
-    *out = v;
+    *out = nvrt_le32(code + at + plen);
+    site->off = funcOff + at;
+    site->len = (unsigned char)(plen + 4);
+    memcpy(site->bytes, code + at, plen + 4);
     return true;
 }
 
@@ -187,19 +207,19 @@ static bool nvrm_runtime_resolve(nvrt_read_fn rd, void *ctx, nvrt_alloc_fn alloc
         size_t initLen = sizeof init, wsLen = sizeof ws;
         if (linkEnd - rt->off[NVRT_LINK] < initLen) initLen = (size_t)(linkEnd - rt->off[NVRT_LINK]);
         if (wsEnd - rt->off[NVRT_WRITESTART] < wsLen) wsLen = (size_t)(wsEnd - rt->off[NVRT_WRITESTART]);
-        if (!nvrt_find_disp(init, initLen, pRmApi, sizeof pRmApi, &rt->physicalRmApi))
+        if (!nvrt_find_disp(init, initLen, rt->off[NVRT_LINK], pRmApi, sizeof pRmApi, &rt->physicalRmApi, &rt->site[0]))
             NVRT_FAIL("physicalRmApi not found");
-        if (!nvrt_find_disp(init, initLen, pMemDesc, sizeof pMemDesc, &rt->usdMemDesc))
+        if (!nvrt_find_disp(init, initLen, rt->off[NVRT_LINK], pMemDesc, sizeof pMemDesc, &rt->usdMemDesc, &rt->site[1]))
             NVRT_FAIL("pMemDesc not found");
-        if (!nvrt_find_disp(init, initLen, pClient, sizeof pClient, &rt->hClient))
+        if (!nvrt_find_disp(init, initLen, rt->off[NVRT_LINK], pClient, sizeof pClient, &rt->hClient, &rt->site[2]))
             NVRT_FAIL("hInternalClient not found");
-        if (!nvrt_find_disp(init, initLen, pSub, sizeof pSub, &rt->hSubdevice))
+        if (!nvrt_find_disp(init, initLen, rt->off[NVRT_LINK], pSub, sizeof pSub, &rt->hSubdevice, &rt->site[3]))
             NVRT_FAIL("hInternalSubdevice not found");
-        if (!nvrt_find_disp(init, initLen, pCtl, sizeof pCtl, &rt->rmapiControl))
+        if (!nvrt_find_disp(init, initLen, rt->off[NVRT_LINK], pCtl, sizeof pCtl, &rt->rmapiControl, &rt->site[4]))
             NVRT_FAIL("RM_API::Control not found");
-        if (!nvrt_find_disp(ws, wsLen, pMap, sizeof pMap, &rt->usdMapBuffer))
+        if (!nvrt_find_disp(ws, wsLen, rt->off[NVRT_WRITESTART], pMap, sizeof pMap, &rt->usdMapBuffer, &rt->site[5]))
             NVRT_FAIL("pMapBuffer not found");
-        if (!nvrt_find_disp(ws, wsLen, pData, sizeof pData, &rt->usdData))
+        if (!nvrt_find_disp(ws, wsLen, rt->off[NVRT_WRITESTART], pData, sizeof pData, &rt->usdData, &rt->site[6]))
             NVRT_FAIL("userSharedData.data not found");
     }
 

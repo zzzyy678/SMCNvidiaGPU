@@ -662,8 +662,9 @@ static unsigned gRuntimeOpenTries;
 static char gRuntimeWhy[96];
 
 /* Read NVRM's symbol table from disk, then install the result only if the first bytes of every function
- * the file names are the bytes that are loaded at base + offset. A driver replaced on disk but not yet
- * reloaded fails that check, so nothing is ever called on the strength of the file alone. */
+ * the file names, and every instruction a field offset came from, are the bytes loaded at base + offset.
+ * A driver replaced on disk but not yet reloaded fails that check, so nothing is ever called or read on the
+ * strength of the file alone. */
 static bool nvrm_bind_runtime(void)
 {
     if (gRuntimeTried)
@@ -701,6 +702,20 @@ static bool nvrm_bind_runtime(void)
              * address derived from the file is touched. */
             snprintf(gRuntimeWhy, sizeof gRuntimeWhy, "loaded driver differs from the one on disk (%s); reboot",
                      kNvrtSymbols[k] + 1);
+            IOFree(rt, sizeof(NvrmRuntime));
+            return false;
+        }
+    }
+    /* Matching prologues are not enough: two builds can start their functions identically while OBJGPU's
+     * layout moved. Every field offset was read out of one instruction, so that instruction, displacement
+     * included, must be in the loaded code at the same place. Each site lies inside a function whose start
+     * just matched, before the next symbol, so the read stays inside the loaded image. */
+    for (unsigned k = 0; k < NVRT_SITES; k++) {
+        const NvrtSite &s = rt->site[k];
+        if (!s.len || memcmp((const void *)(uintptr_t)(base + s.off), s.bytes, s.len) != 0) {
+            snprintf(gRuntimeWhy, sizeof gRuntimeWhy,
+                     "loaded driver uses different OBJGPU offsets than the one on disk (+%#llx); reboot",
+                     (unsigned long long)s.off);
             IOFree(rt, sizeof(NvrmRuntime));
             return false;
         }
