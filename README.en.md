@@ -169,10 +169,22 @@ sudo shutdown -r now
 Uninstall with `sudo ./install.sh --uninstall`. If the machine no longer boots, add `nvsensoff=1` to
 boot-args.
 
-Driver updates change the kernel offsets, so the binding table has to be regenerated from the installed NVRM
-and the kext reinstalled. The kext ships binding tables for several driver builds, each carrying its own
-`OBJGPU` field offsets, so an older driver keeps working; when a build has no table yet, the `nvsmcforce=1` boot argument binds anyway, skipping the signature
-check (wrong addresses can panic the kernel, so it is a last resort). Building needs the VirtualSMC and Lilu sources:
+Driver updates change the kernel offsets. The kext ships binding tables for several driver builds, each carrying
+its own `OBJGPU` field offsets, so an older driver keeps working. When a build has no table yet, the kext reads the
+symbol table of the installed `NVRM.kext` from disk at boot and works the offsets out itself, the same way
+`nvrm_bindings.py` does. It only binds if the start of every function it found, and every instruction a field
+offset was read from, match the code that is actually loaded, so a driver update keeps working without a rebuild
+(`kern.nvgpustate` says why when it does not). The compiled-in tables always come first; the disk is only read when
+none of them matches.
+
+The kext looks in `/Library/Extensions/NVRM.kext` and then `/System/Library/Extensions/NVRM.kext`. A driver injected
+from the EFI partition by OpenCore cannot be read at that point in boot, so auto-binding does not kick in there and
+only the compiled-in tables apply; copy the same `NVRM` binary to the system volume and point `nvrmpath=` at it.
+`tools/test/run.sh [NVRM]` runs the same resolver in user space on any driver binary and compares every value with
+what `nvrm_bindings.py` produces.
+
+As a last resort the
+`nvsmcforce=1` boot argument binds anyway, skipping the signature check (wrong addresses can panic the kernel). Building needs the VirtualSMC and Lilu sources:
 
 ```bash
 VSMCDIR=/path/to/VirtualSMC LILUDIR=/path/to/Lilu/Lilu kext/build.sh              # release
@@ -185,6 +197,10 @@ Add these to OpenCore's `boot-args`:
 
 - `nvsmcforce=1`: bind even when no signature matches after a driver update — the entry checks are skipped and
   the closest table is picked by its anchor. Wrong addresses can panic the kernel, so it is a last resort.
+- `nvrmpath=/absolute/path/to/NVRM`: when no compiled-in table matches, read the driver layout from this file
+  instead of the default locations. Use it when the driver is not in `/Library/Extensions`, e.g. injected from
+  EFI: put a copy of the same `NVRM` binary on the system volume and point at it. A file that does not match the
+  loaded driver is refused.
 - `nvsensoff=1`: the kext loads but never touches the driver.
 
 ## Verify
