@@ -764,16 +764,8 @@ static bool nvrm_bind(void)
         nvsens_state_set("bound NVRM 0x%llx", (unsigned long long)gNvrmBase);
         return true;
     }
-    /* A driver newer than this build: read its layout from disk instead of needing a rebuild. */
-    if (nvrm_bind_runtime()) {
-        nvgpulayout = 1;
-        SMCNVG_LOG("bound NVRM at 0x%llx from %s", (unsigned long long)gNvrmBase, NVRM_DRIVER_PATH);
-        nvsens_state_set("bound NVRM 0x%llx (layout read from the installed driver)",
-                         (unsigned long long)gNvrmBase);
-        return true;
-    }
-    if (!gRuntimeTried)
-        return false;   /* driver file not readable yet: retry on the next tick before giving up */
+    /* Compiled-in tables were generated and signature-checked for exactly one build each: they always win,
+     * and need nothing from disk, so they bind on the first tick. */
     for (int i = 0; i < kLegacyBindingCount; i++) {
         const NvrmLegacyBinding &l = kLegacyBindings[i];
         const NvrmTable t = nvrm_legacy_table(l);
@@ -784,6 +776,16 @@ static bool nvrm_bind(void)
             return true;
         }
     }
+    /* A driver no table knows: read its layout from disk instead of needing a rebuild. */
+    if (nvrm_bind_runtime()) {
+        nvgpulayout = 1;
+        SMCNVG_LOG("bound NVRM at 0x%llx from %s", (unsigned long long)gNvrmBase, NVRM_DRIVER_PATH);
+        nvsens_state_set("bound NVRM 0x%llx (layout read from the installed driver)",
+                         (unsigned long long)gNvrmBase);
+        return true;
+    }
+    if (!gRuntimeTried)
+        return false;   /* driver file not readable yet: retry on the next tick before forcing or giving up */
     if (nvgpufForceArg) {
         /* Pick the table whose anchor still lines up apart from the displacement bytes, so the entry
          * offsets come from the build that is actually installed; fall back to the current table. */
