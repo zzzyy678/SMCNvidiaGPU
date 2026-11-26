@@ -105,6 +105,8 @@ Driver builds tested on an RTX 5080 (GB203) with the
 | 2.9 | ✅ | 2.9 |
 | 3.0 | ✅ | 3.0 |
 | 3.1 | ✅ | 3.1 |
+| 3.0.3-nvk (HighDelay) | ✅ (RTX 2080) | 3.0.3-nvk |
+| 3.0.4-nvk (HighDelay) | untested | 3.0.4-nvk |
 
 Upstream 2.8.1 keeps the exact code layout of 2.8 (every entry signature is byte-identical), so both use the
 2.8 table. [GeekAudio v2.8.1-geekaudio.1-rc3](https://github.com/GeekAudio/nvidia-macos-driver/releases/tag/v2.8.1-geekaudio.1-rc3)
