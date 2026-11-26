@@ -10,7 +10,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 APP="$HERE/build/SMCNvidiaGPUStatus.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
+# EVGA iCX2 reader (C, talks to the NVRM user client); Swift sees it through ICXBridge.h.
+ICX="$HERE/../tools/icx2"
+OBJ="$HERE/build/icx2.o"
+clang -O2 -Wall -target x86_64-apple-macos12.0 -I"$ICX/nvsdk" -I"$ICX/nvsdk/class" -I"$ICX/nvsdk/ctrl" -c "$ICX/icx2.c" -o "$OBJ"
 swiftc -O -target x86_64-apple-macos12.0 -o "$APP/Contents/MacOS/SMCNvidiaGPUStatus" \
+    -import-objc-header "$HERE/ICXBridge.h" "$OBJ" "$HERE/EVGAICX.swift" \
     "$HERE/main.swift" "$HERE/SMCNvidiaGPUStatus.swift" "$HERE/SMCFans.swift" "$HERE/LoginItem.swift" "$HERE/InstanceLock.swift" "$HERE/GPUInfo.swift" "$HERE/Machine.swift" "$HERE/GPUProcess.swift" -framework Cocoa -framework IOKit
 cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
 if [ -d "$HERE/Resources" ]; then mkdir -p "$APP/Contents/Resources" && cp -R "$HERE/Resources/." "$APP/Contents/Resources/"; fi

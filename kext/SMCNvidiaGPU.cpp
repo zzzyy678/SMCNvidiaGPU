@@ -167,6 +167,9 @@ SYSCTL_INT(_kern, OID_AUTO, nvgutilofa, CTLFLAG_RW, &nvgutilofa, 0, "NVIDIA GPU 
 SYSCTL_INT(_kern, OID_AUTO, nvgvramtotal, CTLFLAG_RW, &nvgvramtotal, 0, "NVIDIA GPU VRAM total MB");
 SYSCTL_INT(_kern, OID_AUTO, nvgvramused, CTLFLAG_RW, &nvgvramused, 0, "NVIDIA GPU VRAM used MB");
 SYSCTL_INT(_kern, OID_AUTO, nvgpstate, CTLFLAG_RW, &nvgpstate, 0, "NVIDIA GPU current P-state");
+/* Present only in builds that publish nvgpstate as a number (0 = P0); older builds published RM's bitmask. */
+static int nvgpstateidx = 1;
+SYSCTL_INT(_kern, OID_AUTO, nvgpstateidx, CTLFLAG_RD, &nvgpstateidx, 0, "nvgpstate is an index (1), not a bitmask");
 
 SYSCTL_INT(_kern, OID_AUTO, nvgpupower, CTLFLAG_RD, &nvgpupower, 0, "NVIDIA GPU average power mW (RUSD)");
 SYSCTL_INT(_kern, OID_AUTO, nvgpupower_mod, CTLFLAG_RD, &nvgpupower_mod, 0, "NVIDIA GPU module power mW (RUSD)");
@@ -305,6 +308,8 @@ SYSCTL_STRING(_kern, OID_AUTO, nvgpustate, CTLFLAG_RD, nvgpustate, sizeof(nvgpus
 #define RUSD_TEMP_STRIDE 16u
 #define RUSD_FAN_MAX_COOLERS 16u
 #define RUSD_CLK_DOMAIN_GRAPHICS 0u
+#define RUSD_CLK_DOMAIN_MEMORY 1u
+#define RUSD_CLK_DOMAIN_VIDEO 2u
 #define RUSD_CLK_DOMAIN_SM 3u
 
 #define RUSD_TIMESTAMP_INVALID 0ull
@@ -866,6 +871,7 @@ void SMCNvidiaGPU::registerSysctls()
     sysctl_register_oid(&sysctl__kern_nvgvramtotal);
     sysctl_register_oid(&sysctl__kern_nvgvramused);
     sysctl_register_oid(&sysctl__kern_nvgpstate);
+    sysctl_register_oid(&sysctl__kern_nvgpstateidx);
     sysctl_register_oid(&sysctl__kern_nvgpupower);
     sysctl_register_oid(&sysctl__kern_nvgpupower_mod);
     sysctl_register_oid(&sysctl__kern_nvgpupower_mem);
@@ -981,6 +987,7 @@ void SMCNvidiaGPU::unregisterSysctls()
     sysctl_unregister_oid(&sysctl__kern_nvgvramtotal);
     sysctl_unregister_oid(&sysctl__kern_nvgvramused);
     sysctl_unregister_oid(&sysctl__kern_nvgpstate);
+    sysctl_unregister_oid(&sysctl__kern_nvgpstateidx);
     sysctl_unregister_oid(&sysctl__kern_nvgpupower);
     sysctl_unregister_oid(&sysctl__kern_nvgpupower_mod);
     sysctl_unregister_oid(&sysctl__kern_nvgpupower_mem);
@@ -1443,6 +1450,10 @@ static void nvsmc_rm_thermal_probe(void *pGpu)
     }
 }
 
+/* Set once the PMUMON clock queue has delivered a sample. Turing (and older) never fills that queue, so the
+ * core/memory/NVD clocks are then taken from the RUSD public clock domains instead. */
+static bool gPmumonClocks = false;
+
 static bool nvsmc_rm_clocks(void *pGpu)
 {
     memset(&gClkParams, 0, sizeof gClkParams);
@@ -1457,6 +1468,7 @@ static bool nvsmc_rm_clocks(void *pGpu)
     nvgdramclk = (int)(x.dramKHz / 1000);
     nvgnvdclk = (int)(x.nvdKHz / 1000);
     nvgactivegpc = (int)(x.activeGpcKHz / 1000);
+    gPmumonClocks = true;
     return true;
 }
 
@@ -1590,7 +1602,10 @@ static bool nvsmc_rm_pstate(void *pGpu)
     UInt32 ps = 0;
     if (!nvsmc_rm_call_gpu(pGpu, 0x20802068u, &ps, sizeof ps, nullptr))
         return false;
-    nvgpstate = (int)ps;
+    /* RM answers with a one-bit mask (NV2080_CTRL_PERF_PSTATES_P0 = 0x1 ... P15 = 0x8000), not a number. */
+    if (ps == 0 || (ps & (ps - 1)))
+        return false;
+    nvgpstate = __builtin_ctz(ps);
     return true;
 }
 
@@ -1695,6 +1710,13 @@ void SMCNvidiaGPU::readRusd()
         UInt32 smKHz = clk.info[RUSD_CLK_DOMAIN_SM * 2 + 1];
         if (gfxKHz && gfxKHz < 10000000u) nvgpugfxclk = (int)(gfxKHz / 1000u);
         if (smKHz && smKHz < 10000000u) nvgpusmclk = (int)(smKHz / 1000u);
+        if (!gPmumonClocks) {
+            UInt32 memKHz = clk.info[RUSD_CLK_DOMAIN_MEMORY * 2 + 1];
+            UInt32 vidKHz = clk.info[RUSD_CLK_DOMAIN_VIDEO * 2 + 1];
+            if (gfxKHz < 10000000u) nvggpcclk = (int)(gfxKHz / 1000u);
+            if (memKHz < 20000000u) nvgdramclk = (int)(memKHz / 1000u);
+            if (vidKHz < 10000000u) nvgnvdclk = (int)(vidKHz / 1000u);
+        }
     }
     for (int i = 0; i < 5; i++) {
         struct { UInt64 ts; SInt32 temp; UInt32 pad; } temp;

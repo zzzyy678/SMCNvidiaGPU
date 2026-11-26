@@ -9,12 +9,17 @@ Scripts and other tools can read the sysctls directly (none of this goes into SM
 |---|---|
 | `kern.nvgputemp` `nvgpupower` `nvgpufan` `nvgutil` | temperature, average power, fan RPM, utilisation |
 | `kern.nvgvramused` `nvgvramtotal` | VRAM used / total (MB) |
-| `kern.nvggpcclk` `nvgdramclk` `nvgpstate` | core clock, memory clock, p-state |
+| `kern.nvggpcclk` `nvgdramclk` | core clock, memory clock (MHz) |
+| `kern.nvgpstate` | current P-state as a number: 0 = P0, 8 = P8. Up to 2.3 this was the driver's raw bitmask (P0 = `0x1`, P8 = `0x100`) |
+| `kern.nvgpstateidx` | always 1, meaning `nvgpstate` is a number; builds without this key publish the bitmask |
 | `kern.nvgutilfb` `nvgutilenc` `nvgutildec` | memory-bandwidth / encoder / decoder utilisation |
 | `kern.nvgpuprocpid0..4` `nvgpuprocutil0..4` `nvgpuprocraw0..4` | busiest GPU processes (pid, integer %, raw ×100) |
 | `kern.nvgpudiscover` | how the driver was located (`via=property/platform`, scan result, agreement) |
 | `kern.nvgpuvramtemp` | VRAM temperature in °C (0 when the card reports none) |
 | `kern.nvgputhermstat` `nvgputhermcount` `nvgputhermraw` | driver-side thermal sensor probe |
+
+Scripts that read `nvgpstate` the old way (treating `0x1` as P0) should check `kern.nvgpstateidx` first: if it
+exists and is 1, use the value as is; otherwise take the position of the lowest set bit.
 
 `nvgputhermstat` is 1 when the driver accepted the thermal query and `nvgputhermcount` is the sensor count
 (1 on this GB203: the GPU sensor only).
@@ -100,6 +105,8 @@ Driver builds tested on an RTX 5080 (GB203) with the
 | 2.9 | ✅ | 2.9 |
 | 3.0 | ✅ | 3.0 |
 | 3.1 | ✅ | 3.1 |
+| 3.0.3-nvk (HighDelay) | ✅ (RTX 2080) | 3.0.3-nvk |
+| 3.0.4-nvk (HighDelay) | untested | 3.0.4-nvk |
 
 Upstream 2.8.1 keeps the exact code layout of 2.8 (every entry signature is byte-identical), so both use the
 2.8 table. [GeekAudio v2.8.1-geekaudio.1-rc3](https://github.com/GeekAudio/nvidia-macos-driver/releases/tag/v2.8.1-geekaudio.1-rc3)

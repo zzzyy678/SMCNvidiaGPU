@@ -15,6 +15,10 @@ if CommandLine.arguments.contains("--disable-login-item") {
     exit(0)
 }
 
+if CommandLine.arguments.contains("--dump-menu") {
+    dumpMenuAndExit()
+}
+
 guard InstanceLock.claim() else {
     exit(0)             // another copy is already in the menu bar
 }
