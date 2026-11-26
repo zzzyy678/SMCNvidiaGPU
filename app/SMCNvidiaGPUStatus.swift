@@ -66,6 +66,7 @@ private func sysctlString(_ name: String) -> String? {
 private struct Snapshot {
     var loaded = false
     var temp = 0, vramTemp = 0, powerMW = 0, instMW = 0, tgpMW = 0, limitMW = 0
+    var powerIsInstant = false
     var fanRPM = 0, fanCount = 0, fanMax = 3500
     var fans: [Int] = []
     var systemFans: [SMCFan] = []      // fallback for laptop GPUs that expose no fan of their own
@@ -95,6 +96,9 @@ private func readSnapshot() -> Snapshot {
     s.vramTemp = sysctlInt("kern.nvgpuvramtemp") ?? 0
     s.powerMW = sysctlInt("kern.nvgpupower") ?? 0
     s.instMW = sysctlInt("kern.nvgpuinstpower") ?? 0
+    /* Turing's firmware leaves the averaged power at 0 and only reports the instant reading: use that one
+     * everywhere (menu bar, menu, copy) instead of showing 0 W. */
+    if s.powerMW == 0 && s.instMW > 0 { s.powerMW = s.instMW; s.instMW = 0; s.powerIsInstant = true }
     s.tgpMW = sysctlInt("kern.nvgputgp") ?? 0
     s.limitMW = sysctlInt("kern.nvgpupwrlimit") ?? 0
     s.limitReqMW = sysctlInt("kern.nvgpupwrlimit_req") ?? 0
@@ -140,6 +144,23 @@ private func readSnapshot() -> Snapshot {
     s.gpcMHz = sysctlInt("kern.nvggpcclk") ?? 0
     s.dramMHz = sysctlInt("kern.nvgdramclk") ?? 0
     s.nvdMHz = sysctlInt("kern.nvgnvdclk") ?? 0
+    /* Older kexts only fill these from the PMUMON clock queue, which Turing never fills. The RUSD public clock
+     * domains (graphics, memory, video) are in the kext's raw RUSD dump at 0x48: u64 timestamp, then
+     * {targetMHz, actualKHz} pairs. */
+    if s.gpcMHz == 0 || s.dramMHz == 0, let dump = sysctlString("kern.nvgpurusddump"), dump.count >= (0x48 + 8 + 24) * 2 {
+        func u32(_ off: Int) -> Int {
+            var v = 0
+            for i in (0..<4).reversed() {
+                let start = dump.index(dump.startIndex, offsetBy: (off + i) * 2)
+                v = (v << 8) | (Int(dump[start..<dump.index(start, offsetBy: 2)], radix: 16) ?? 0)
+            }
+            return v
+        }
+        let gfx = u32(0x48 + 8 + 4) / 1000, mem = u32(0x48 + 8 + 12) / 1000, vid = u32(0x48 + 8 + 20) / 1000
+        if s.gpcMHz == 0 && gfx < 10000 { s.gpcMHz = gfx }
+        if s.dramMHz == 0 && mem < 20000 { s.dramMHz = mem }
+        if s.nvdMHz == 0 && vid < 10000 { s.nvdMHz = vid }
+    }
     s.util = (sysctlInt("kern.nvgutil") ?? 0) / 100
     s.procUtil = sysctlInt("kern.nvgpuprocutil") ?? 0
     s.procPid = sysctlInt("kern.nvgpuprocpid") ?? 0
@@ -157,6 +178,10 @@ private func readSnapshot() -> Snapshot {
     s.vramUsedMB = sysctlInt("kern.nvgvramused") ?? 0
     s.vramTotalMB = sysctlInt("kern.nvgvramtotal") ?? 0
     s.pstate = sysctlInt("kern.nvgpstate") ?? 0
+    /* Older kexts publish RM's one-bit mask (0x1 = P0, 0x100 = P8); newer ones say so with nvgpstateidx. */
+    if sysctlInt("kern.nvgpstateidx") == nil, s.pstate > 0, s.pstate & (s.pstate - 1) == 0 {
+        s.pstate = s.pstate.trailingZeroBitCount
+    }
     if let st = sysctlInt("debug.nvrm_tgp_state") {
         s.tgpPresent = true
         s.tgpState = st
@@ -1023,7 +1048,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                              iconTint: vramTempColor(last.vramTemp)))
         }
         let powerFrac = last.limitMW > 0 ? Double(last.powerMW) / Double(last.limitMW) : 0
-        menu.addItem(row(L("功耗（平均）", "功耗（平均）", "Average power"), watts(last.powerMW), symbol: "bolt.fill",
+        menu.addItem(row(last.powerIsInstant ? L("功耗", "功耗", "GPU power") : L("功耗（平均）", "功耗（平均）", "Average power"), watts(last.powerMW), symbol: "bolt.fill",
                          iconTint: powerFrac > 0.85 ? .systemRed : (powerFrac > 0.6 ? .systemOrange : .systemYellow),
                          effect: powerFrac > 0.5 ? .pulse(amp: 0.10, hz: 2.2) : .none,
                          bar: last.limitMW > 0 ? (powerFrac, loadColor(powerFrac)) : nil))
@@ -1235,7 +1260,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var lines: [String] = ["SMCNvidiaGPU"]
         if last.vramTemp > 0 { lines.append(L("显存温度: \(TempUnit.value(last.vramTemp)) \(TempUnit.mark)", "顯存溫度: \(TempUnit.value(last.vramTemp)) \(TempUnit.mark)", "VRAM temperature: \(TempUnit.value(last.vramTemp)) \(TempUnit.mark)")) }
         lines.append(L("核心温度: \(TempUnit.value(last.temp)) \(TempUnit.mark)", "核心溫度: \(TempUnit.value(last.temp)) \(TempUnit.mark)", "Core temperature: \(TempUnit.value(last.temp)) \(TempUnit.mark)"))
-        lines.append(L("功耗(平均): \(watts(last.powerMW))", "功耗(平均): \(watts(last.powerMW))", "Average power: \(watts(last.powerMW))"))
+        lines.append(last.powerIsInstant ? L("功耗: \(watts(last.powerMW))", "功耗: \(watts(last.powerMW))", "GPU power: \(watts(last.powerMW))")
+                     : L("功耗(平均): \(watts(last.powerMW))", "功耗(平均): \(watts(last.powerMW))", "Average power: \(watts(last.powerMW))"))
         if last.instMW > 0 { lines.append(L("功耗(瞬时): \(watts(last.instMW))", "功耗(瞬時): \(watts(last.instMW))", "Instant power: \(watts(last.instMW))")) }
         if last.tgpMW > 0 { lines.append("TGP: \(watts(last.tgpMW))") }
         if last.limitMW > 0 {
