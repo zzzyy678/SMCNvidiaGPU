@@ -67,6 +67,7 @@ private struct Snapshot {
     var loaded = false
     var temp = 0, vramTemp = 0, powerMW = 0, instMW = 0, tgpMW = 0, limitMW = 0
     var powerIsInstant = false
+    var fanTargets: [Int?] = []   /* per fan: the iCX target %, nil when the speed source has none */
     var fanRPM = 0, fanCount = 0, fanMax = 3500
     var fans: [Int] = []
     var systemFans: [SMCFan] = []      // fallback for laptop GPUs that expose no fan of their own
@@ -504,6 +505,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let showVRAMKey = "showVRAM"
     private let showFanKey = "showFan", showUtilKey = "showUtil"
     private let trueFanSpeedKey = "fanTrueSpeed"
+    private let icxKey = "icxEnabled", icxPowerKey = "icxPower"
 
     private var dataMenu: NSMenu!
     private var optionsMenu: NSMenu!
@@ -546,6 +548,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refresh() {
         last = readSnapshot()
+        if last.loaded && on(icxKey, default: true) { EVGAICX.shared.poll(power: on(icxPowerKey, default: true)) }
+        mergeICXFans()
         updateTitle()
         if menuOpen {
             syncOpenMenuValues()        /* keep the open menu's numbers live without rebuilding it */
@@ -553,6 +557,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         dataMenu = buildDataMenu()
         optionsMenu = buildOptionsMenu()
+    }
+
+    /// EVGA iCX cards (RTX 2080 FTW3): Fan 1 is the GPU's own and its RPM comes from the NVIDIA driver; Fans 2 and 3
+    /// are driven and measured by the iCX. The driver's second value is a copy of Fan 1. Called on every refresh and
+    /// again right before the menu is built, so a menu never shows the driver's two fans next to iCX data.
+    private func mergeICXFans() {
+        guard last.loaded, on(icxKey, default: true), last.fanTargets.isEmpty,
+              let icx = EVGAICX.shared.sample, icx.fans.count == 2 else { return }
+        last.fans = [last.fans.first ?? 0] + icx.fans.map { $0.rpm }
+        last.fanTargets = [nil] + icx.fans.map { $0.target }
+        last.fanRPM = last.fans.max() ?? 0
+    }
+
+    /// Self-test: the text of every row of the data menu, as the menu would show it now.
+    func dumpDataMenu() -> [String] {
+        refresh()
+        mergeICXFans()
+        suppressLiveRegistration = true
+        let menu = buildDataMenu()
+        suppressLiveRegistration = false
+        return menu.items.compactMap { item in
+            guard let v = item.view else { return item.isSeparatorItem ? "----" : item.title }
+            return v.subviews.compactMap { ($0 as? NSTextField)?.stringValue }.filter { !$0.isEmpty }.joined(separator: " | ")
+        }
     }
 
     /// Rebuild the data menu off-screen and copy the fresh values into the menu that is currently open.
@@ -615,6 +643,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             optionsMenu.delegate = self
             statusItem.menu = optionsMenu
         } else {
+            mergeICXFans()
             dataMenu = buildDataMenu()
             dataMenu.delegate = self
             statusItem.menu = dataMenu
@@ -957,7 +986,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Compact row: one small spinning fan per row with the live reading. The row is only 34 pt tall, so a
     /// single fan and a pair both look balanced.
-    private func fanRow(index: Int, rpm: Int, label: String? = nil, showPercent: Bool = true) -> NSMenuItem {
+    private func fanRow(index: Int, rpm: Int, label: String? = nil, showPercent: Bool = true, icxPercent: Int? = nil) -> NSMenuItem {
         let width = menuWidth
         let height: CGFloat = 28
         let v = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
@@ -978,11 +1007,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         l.frame = NSRect(x: 36, y: 6, width: 90, height: 16)
         v.addSubview(l)
 
-        let pct = last.fanMax > 0 ? Int((Double(rpm) / Double(last.fanMax) * 100).rounded()) : 0
-        let rpmText = rpm > 0 ? "\(rpm) " + L("转/分", "轉/分", "RPM") : L("停转", "停轉", "Stopped")
-        let r = NSTextField(labelWithString: rpm > 0 && showPercent ? rpmText + " · \(pct)%" : rpmText)
+        let pct = icxPercent ?? (last.fanMax > 0 ? Int((Double(rpm) / Double(last.fanMax) * 100).rounded()) : 0)
+        let spinning = rpm > 0
+        let text = spinning ? "\(rpm) " + L("转/分", "轉/分", "RPM") + (showPercent ? " · \(pct)%" : "")
+                            : L("停转", "停轉", "Stopped")
+        let r = NSTextField(labelWithString: text)
         r.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        r.textColor = rpm > 0 ? .labelColor : .tertiaryLabelColor
+        r.textColor = spinning ? .labelColor : .tertiaryLabelColor
         r.alignment = .right
         r.frame = NSRect(x: 130, y: 6, width: width - 144, height: 16)
         v.addSubview(r)
@@ -1009,6 +1040,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.representedObject = key
         item.state = on(key, default: def ?? defaultFor(key)) ? .on : .off
         return item
+    }
+
+    // ---- EVGA iCX2
+
+    private func icxTemps(_ s: EVGAICX.Sample, prefix: String) -> [Int] {
+        s.temps.filter { $0.name.hasPrefix(prefix) }.map { $0.celsius }
+    }
+
+    private func icxList(_ values: [Int]) -> String {
+        values.map { "\(TempUnit.value($0))" }.joined(separator: " / ") + " \(TempUnit.mark)"
+    }
+
+    /// Four rows (GPU, memory, power stages, board input) instead of nine: the per-sensor numbers sit side by side.
+    private func addICXSection(to menu: NSMenu) {
+        guard on(icxKey, default: true), let s = EVGAICX.shared.sample, !s.temps.isEmpty else { return }
+        menu.addItem(.separator())
+        menu.addItem(sectionHeader("EVGA iCX"))
+        for (prefix, label, symbol) in [("GPU", L("GPU 温度", "GPU 溫度", "GPU"), "thermometer.medium"),
+                                        ("MEM", L("显存", "顯存", "Memory"), "memorychip"),
+                                        ("PWR", L("供电", "供電", "Power stages"), "bolt.horizontal")] {
+            let t = icxTemps(s, prefix: prefix)
+            guard let hottest = t.max() else { continue }
+            menu.addItem(row(label, icxList(t), color: tempColor(hottest), symbol: symbol, iconTint: tempColor(hottest)))
+        }
+        if !s.rails.isEmpty {
+            menu.addItem(row(L("整卡输入功率 (12 V)", "整卡輸入功率 (12 V)", "Whole-card power (12 V in)"), String(format: "%.1f W", s.watts), symbol: "powerplug"))
+            for r in s.rails {
+                let w = Double(r.mA) * Double(r.mV) / 1e6
+                menu.addItem(row("   " + L("12 V 输入 ", "12 V 輸入 ", "12 V input ") + r.name.replacingOccurrences(of: "Input ", with: ""), String(format: "%.2f A · %.2f V · %.1f W", Double(r.mA) / 1000, Double(r.mV) / 1000, w),
+                                 color: .secondaryLabelColor))
+            }
+        }
     }
 
     // ---- menu
@@ -1068,6 +1131,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             else { v = L("跟随电源 · 电池", "跟隨電源 · 電池", "follows source · battery") }
             menu.addItem(row(L("电源预算", "電源預算", "Power budget"), v, symbol: "powerplug"))
         }
+        addICXSection(to: menu)
 
         menu.addItem(.separator())
         if last.fans.isEmpty && !last.systemFans.isEmpty {
@@ -1081,7 +1145,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.addItem(row(L("风扇", "風扇", "Fan"), L("停转（Zero RPM）", "停轉（Zero RPM）", "Stopped (Zero RPM)"), color: .secondaryLabelColor, symbol: "fanblades.slash"))
             }
             for (i, rpm) in last.fans.enumerated() {
-                menu.addItem(fanRow(index: i, rpm: rpm))
+                if last.fanTargets.isEmpty {
+                    menu.addItem(fanRow(index: i, rpm: rpm))
+                } else {
+                    /* iCX layout: Fan 2/3 show the iCX target %, Fan 1 has no reliable % (unknown max RPM). */
+                    let target = i < last.fanTargets.count ? last.fanTargets[i] : nil
+                    menu.addItem(fanRow(index: i, rpm: rpm, showPercent: target != nil, icxPercent: target))
+                }
             }
         }
 
@@ -1162,6 +1232,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginItem.image = NSImage(systemSymbolName: "power.circle", accessibilityDescription: nil)
         loginItem.state = enabledNow ? .on : .off
         menu.addItem(loginItem)
+        let icxItem = NSMenuItem(title: L("EVGA iCX 传感器", "EVGA iCX 感測器", "EVGA iCX sensors"), action: #selector(toggleICX(_:)), keyEquivalent: "")
+        icxItem.target = self
+        icxItem.representedObject = icxKey
+        icxItem.image = NSImage(systemSymbolName: "sensor", accessibilityDescription: nil)
+        icxItem.state = on(icxKey, default: true) ? .on : .off
+        menu.addItem(icxItem)
+        let icxPowerItem = NSMenuItem(title: L("EVGA iCX 功率读数", "EVGA iCX 功率讀數", "EVGA iCX power readings"), action: #selector(toggleICX(_:)), keyEquivalent: "")
+        icxPowerItem.target = self
+        icxPowerItem.representedObject = icxPowerKey
+        icxPowerItem.image = NSImage(systemSymbolName: "powerplug", accessibilityDescription: nil)
+        icxPowerItem.state = on(icxPowerKey, default: true) ? .on : .off
+        menu.addItem(icxPowerItem)
 
         let titleMenu = NSMenu()
         titleMenu.addItem(toggleItem(L("温度", "溫度", "Temperature"), key: showTempKey))
@@ -1236,6 +1318,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
           "Please check that \(LoginItem.plistURL.path) is writable.")
     }
 
+    @objc private func toggleICX(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        let now = !on(key, default: true)
+        UserDefaults.standard.set(now, forKey: key)
+        sender.state = now ? .on : .off
+        if key == icxKey && !now { EVGAICX.shared.stop() }
+        refresh()
+    }
+
     @objc private func quit() { NSApplication.shared.terminate(nil) }
     @objc private func refreshNow() { refresh() }
 
@@ -1294,12 +1385,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let metal = MetalInfo.number { lines.append("Metal: " + metal) }
         lines.append(L("降频原因: ", "降頻原因: ", "Throttle reason: ") + throttleText(last.throttle))
         if let v = last.vbios { lines.append("VBIOS: \(v)") }
+        if on(icxKey, default: true), let s = EVGAICX.shared.sample {
+            lines.append("EVGA iCX: " + s.temps.map { "\($0.name) \(TempUnit.value($0.celsius))\(TempUnit.mark)" }.joined(separator: ", "))
+            for (i, f) in s.fans.enumerated() { lines.append("EVGA iCX Fan \(i + 2): \(f.rpm) RPM (target \(f.target) %)") }
+            for r in s.rails { lines.append("EVGA iCX \(r.name): " + String(format: "%.2f A, %.2f V, %.1f W", Double(r.mA) / 1000, Double(r.mV) / 1000, Double(r.mA) * Double(r.mV) / 1e6)) }
+        }
         lines.append(L("状态: ", "狀態: ", "Status: ") + last.state)
 
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(lines.joined(separator: "\n"), forType: .string)
     }
+}
+
+/// `SMCNvidiaGPUStatus --dump-menu`: start like the menu bar app, wait for the sensors, print the data menu, exit.
+func dumpMenuAndExit() {
+    let app = NSApplication.shared
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+        for line in delegate.dumpDataMenu() { print(line) }
+        exit(0)
+    }
+    app.run()
 }
 
 func runApp() {

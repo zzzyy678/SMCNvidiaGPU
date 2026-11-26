@@ -38,3 +38,6 @@ nmprobe/gpu_spin
 *~
 .idea/
 .vscode/
+
+# ── iCX2 读取工具 ──
+tools/icx2/icx2read
