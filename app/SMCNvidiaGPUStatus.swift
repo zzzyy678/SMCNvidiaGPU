@@ -147,7 +147,7 @@ private func readSnapshot() -> Snapshot {
     /* Older kexts only fill these from the PMUMON clock queue, which Turing never fills. The RUSD public clock
      * domains (graphics, memory, video) are in the kext's raw RUSD dump at 0x48: u64 timestamp, then
      * {targetMHz, actualKHz} pairs. */
-    if s.gpcMHz == 0 || s.dramMHz == 0, let dump = sysctlString("kern.nvgpurusddump"), dump.count >= (0x48 + 8 + 24) * 2 {
+    if s.gpcMHz == 0 || s.dramMHz == 0 || s.nvdMHz == 0, let dump = sysctlString("kern.nvgpurusddump"), dump.count >= (0x48 + 8 + 24) * 2 {
         func u32(_ off: Int) -> Int {
             var v = 0
             for i in (0..<4).reversed() {
